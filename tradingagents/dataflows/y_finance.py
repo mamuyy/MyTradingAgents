@@ -191,31 +191,116 @@ def _get_stock_stats_bulk(
     curr_date: Annotated[str, "current date for reference"]
 ) -> dict:
     """
-    Optimized bulk calculation of stock stats indicators.
-    Fetches data once and calculates indicator for all available dates.
-    Returns dict mapping date strings to indicator values.
+    Bulk calculation of common technical indicators using pandas.
+    This avoids stockstats Date-column compatibility issues.
     """
-    from stockstats import wrap
-
     data = load_ohlcv(symbol, curr_date)
-    df = wrap(data)
-    df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
-    
-    # Calculate the indicator for all rows at once
-    df[indicator]  # This triggers stockstats to calculate the indicator
-    
-    # Create a dictionary mapping date strings to indicator values
+
+    if data is None or data.empty:
+        return {}
+
+    data = data.copy()
+
+    if "Date" not in data.columns:
+        data = data.reset_index()
+
+    if "Date" not in data.columns and "index" in data.columns:
+        data = data.rename(columns={"index": "Date"})
+
+    if "Date" not in data.columns and "Datetime" in data.columns:
+        data = data.rename(columns={"Datetime": "Date"})
+
+    if "Date" not in data.columns:
+        raise KeyError(f"Date column not found. Columns available: {list(data.columns)}")
+
+    rename_map = {
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Adj Close": "adj_close",
+        "Volume": "volume",
+    }
+    data = data.rename(columns={k: v for k, v in rename_map.items() if k in data.columns})
+
+    required_cols = ["Date", "open", "high", "low", "close"]
+    missing_cols = [c for c in required_cols if c not in data.columns]
+    if missing_cols:
+        raise KeyError(f"Missing required columns: {missing_cols}. Columns available: {list(data.columns)}")
+
+    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+    data = data.dropna(subset=["Date"])
+    data = data.sort_values("Date").reset_index(drop=True)
+
+    close = data["close"].astype(float)
+    high = data["high"].astype(float)
+    low = data["low"].astype(float)
+
+    # Moving averages
+    data["close_50_sma"] = close.rolling(window=50, min_periods=1).mean()
+    data["close_200_sma"] = close.rolling(window=200, min_periods=1).mean()
+    data["close_10_ema"] = close.ewm(span=10, adjust=False).mean()
+
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    data["macd"] = ema12 - ema26
+    data["macds"] = data["macd"].ewm(span=9, adjust=False).mean()
+    data["macdh"] = data["macd"] - data["macds"]
+
+    # RSI 14
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=14, min_periods=14).mean()
+    avg_loss = loss.rolling(window=14, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    data["rsi"] = 100 - (100 / (1 + rs))
+
+    # Bollinger Bands 20
+    data["boll"] = close.rolling(window=20, min_periods=1).mean()
+    boll_std = close.rolling(window=20, min_periods=1).std()
+    data["boll_ub"] = data["boll"] + (2 * boll_std)
+    data["boll_lb"] = data["boll"] - (2 * boll_std)
+
+    # ATR 14
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    data["atr"] = tr.rolling(window=14, min_periods=1).mean()
+
+    # Optional volume indicators
+    if "volume" in data.columns:
+        volume = data["volume"].astype(float)
+        data["vwma"] = (close * volume).rolling(window=20, min_periods=1).sum() / volume.rolling(window=20, min_periods=1).sum()
+        typical_price = (high + low + close) / 3
+        money_flow = typical_price * volume
+        positive_flow = money_flow.where(typical_price > typical_price.shift(1), 0)
+        negative_flow = money_flow.where(typical_price < typical_price.shift(1), 0)
+        money_ratio = positive_flow.rolling(14, min_periods=1).sum() / negative_flow.rolling(14, min_periods=1).sum().replace(0, pd.NA)
+        data["mfi"] = 100 - (100 / (1 + money_ratio))
+
+    if indicator not in data.columns:
+        raise KeyError(f"Indicator {indicator} was not calculated. Columns available: {list(data.columns)}")
+
+    data["Date"] = data["Date"].dt.strftime("%Y-%m-%d")
+
     result_dict = {}
-    for _, row in df.iterrows():
+    for _, row in data.iterrows():
         date_str = row["Date"]
         indicator_value = row[indicator]
-        
-        # Handle NaN/None values
+
         if pd.isna(indicator_value):
             result_dict[date_str] = "N/A"
         else:
-            result_dict[date_str] = str(indicator_value)
-    
+            try:
+                result_dict[date_str] = str(round(float(indicator_value), 4))
+            except Exception:
+                result_dict[date_str] = str(indicator_value)
+
     return result_dict
 
 
